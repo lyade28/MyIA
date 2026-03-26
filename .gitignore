@@ -1,0 +1,20 @@
+node_modules/
+dist/
+
+# Secrets / config locaux
+.env
+.env.*
+service-account.json
+
+# Données locales runtime
+memory.db
+memory.db-*
+*.sqlite
+*.sqlite3
+
+# Logs / temporaires
+*.log
+.DS_Store
+
+# Projets générés par l'agent
+workspace/
