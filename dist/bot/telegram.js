@@ -2,6 +2,8 @@ import { Bot } from "grammy";
 import { env } from "../config/env.js";
 import { processUserMessage } from "../agent/loop.js";
 import { transcribeAudio } from "../agent/llm.js";
+import { formatLlmErrorForUser } from "../agent/llmPolicy.js";
+import { formatStatsForTelegram } from "../memory/metrics.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -22,6 +24,35 @@ function buildAgentTask(task) {
         `Tache utilisateur: ${task}`,
     ].join("\n");
 }
+function isStatsAdmin(userId) {
+    const admins = env.TELEGRAM_ADMIN_USER_IDS ?? env.TELEGRAM_ALLOWED_USER_IDS;
+    return admins.includes(userId);
+}
+async function relayStatusToTelegram(event, reply) {
+    const id = event.taskId ? `[${event.taskId}] ` : "";
+    switch (event.type) {
+        case "task_start":
+            await reply(`🚀 Début de tâche ${id}\n${event.message}`);
+            break;
+        case "plan":
+            await reply(`📋 ${id}${event.message}`);
+            break;
+        case "step_start":
+            await reply(`⏳ ${id}${event.message}`);
+            break;
+        case "step_done":
+            await reply(`✅ ${id}${event.message}`);
+            break;
+        case "done":
+            await reply(`🏁 Fin ${id}\n${event.message}\n\nTACHE TERMINEE (orchestration).`);
+            break;
+        case "error":
+            await reply(`❌ ${id}${event.message}`);
+            break;
+        default:
+            await reply(`• ${id}${event.message}`);
+    }
+}
 // Middleware strict de Whitelist
 bot.use(async (ctx, next) => {
     const userId = ctx.from?.id;
@@ -33,7 +64,6 @@ bot.use(async (ctx, next) => {
         await ctx.reply("⛔ Vous n'êtes pas autorisé à utiliser ce bot.");
         return;
     }
-    // Utilisateur autorisé, on passe au middleware suivant
     await next();
 });
 // Commande pour effacer la mémoire
@@ -51,6 +81,22 @@ bot.command("clear", async (ctx) => {
         await ctx.reply("❌ Erreur lors de l'effacement de la mémoire.");
     }
 });
+bot.command("stats", async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    if (!isStatsAdmin(userId)) {
+        await ctx.reply("⛔ Commande réservée aux administrateurs.");
+        return;
+    }
+    try {
+        await ctx.reply(formatStatsForTelegram(), { parse_mode: "Markdown" });
+    }
+    catch (e) {
+        console.error("stats:", e);
+        await ctx.reply("❌ Impossible de lire les statistiques.");
+    }
+});
 // Commande dédiée: exécution d'une tâche "mode agent"
 bot.command("run-agent", async (ctx) => {
     const userId = ctx.from?.id;
@@ -65,14 +111,14 @@ bot.command("run-agent", async (ctx) => {
     await ctx.replyWithChatAction("typing");
     const framedTask = buildAgentTask(task);
     try {
-        const response = await processUserMessage(userId, framedTask);
+        const response = await processUserMessage(userId, framedTask, (event) => relayStatusToTelegram(event, (text) => ctx.reply(text)));
         for (let i = 0; i < response.length; i += 4000) {
             await ctx.reply(response.substring(i, i + 4000));
         }
     }
     catch (error) {
         console.error("❌ Erreur run-agent :", error);
-        await ctx.reply("❌ Une erreur est survenue pendant l'execution de /run-agent.");
+        await ctx.reply(`❌ ${formatLlmErrorForUser(error)}`);
     }
 });
 // Gestion des messages texte
@@ -82,18 +128,16 @@ bot.on("message:text", async (ctx) => {
     if (text.trim().startsWith("/"))
         return;
     console.log(`💬 Message de ${userId}: ${text}`);
-    // Indicateur "en train de taper..."
     await ctx.replyWithChatAction("typing");
     try {
-        const response = await processUserMessage(userId, buildAgentTask(text));
-        // Diviser le message s'il est trop long pour Telegram (>4096)
+        const response = await processUserMessage(userId, buildAgentTask(text), (event) => relayStatusToTelegram(event, (txt) => ctx.reply(txt)));
         for (let i = 0; i < response.length; i += 4000) {
             await ctx.reply(response.substring(i, i + 4000));
         }
     }
     catch (error) {
         console.error("❌ Erreur traitement message :", error);
-        await ctx.reply("❌ Une erreur est survenue lors du traitement de votre demande.");
+        await ctx.reply(`❌ ${formatLlmErrorForUser(error)}`);
     }
 });
 // Gestion des notes vocales
@@ -105,16 +149,13 @@ bot.on("message:voice", async (ctx) => {
     const tempDir = os.tmpdir();
     const filePath = path.join(tempDir, `voice_${Date.now()}.ogg`);
     try {
-        // 1. Récupérer le lien du fichier via Telegram
         const file = await ctx.getFile();
         const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-        // 2. Télécharger le fichier
         const response = await fetch(fileUrl);
         if (!response.ok)
             throw new Error("Échec du téléchargement du fichier vocal");
         const fileStream = fs.createWriteStream(filePath);
         await pipeline(Readable.fromWeb(response.body), fileStream);
-        // 3. Transcrire avec Whisper (Groq)
         console.log(`[Agent] Transcription audio en cours...`);
         const transcribedText = await transcribeAudio(filePath);
         console.log(`[Agent] Audio transcrit : "${transcribedText}"`);
@@ -122,20 +163,17 @@ bot.on("message:voice", async (ctx) => {
             await ctx.reply("Désolé, je n'ai pas pu comprendre l'audio.");
             return;
         }
-        // 4. Envoyer le texte à la boucle de l'agent
         await ctx.reply(`📝 _Transcription : ${transcribedText}_`, { parse_mode: "Markdown" });
-        const responseText = await processUserMessage(userId, transcribedText);
-        // 5. Répondre
+        const responseText = await processUserMessage(userId, buildAgentTask(transcribedText), (event) => relayStatusToTelegram(event, (txt) => ctx.reply(txt)));
         for (let i = 0; i < responseText.length; i += 4000) {
             await ctx.reply(responseText.substring(i, i + 4000));
         }
     }
     catch (error) {
         console.error("❌ Erreur traitement audio :", error);
-        await ctx.reply("❌ Une erreur est survenue lors du traitement de votre note vocale.");
+        await ctx.reply(`❌ ${formatLlmErrorForUser(error)}`);
     }
     finally {
-        // Nettoyage du fichier temporaire
         if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
         }
@@ -143,7 +181,6 @@ bot.on("message:voice", async (ctx) => {
 });
 export async function startBot() {
     console.log("🚀 Lancement du bot Telegram...");
-    // Long polling
     bot.start({
         onStart(botInfo) {
             console.log(`✅ Bot ${botInfo.username} démarré en mode sans échec (whitelist active).`);

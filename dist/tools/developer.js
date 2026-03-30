@@ -93,6 +93,34 @@ function resolveBaseDir(workspace, optionalCwd) {
     }
     return workspace;
 }
+/** Chemins / segments sensibles (secrets, clés) — lecture/écriture refusée dans workspace. */
+function isSensitiveProjectPath(normalizedRelativePath) {
+    const lower = normalizedRelativePath.replace(/\\/g, "/").toLowerCase();
+    const base = path.basename(lower);
+    const denyNames = new Set([
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.development",
+        ".npmrc",
+        "id_rsa",
+        "id_rsa.pub",
+        "credentials.json",
+        "service-account.json",
+        "firebase-adminsdk",
+    ]);
+    if (denyNames.has(base) || base.startsWith(".env"))
+        return true;
+    if (lower.includes("/.ssh/") || lower.startsWith(".ssh/"))
+        return true;
+    if (/(^|\/)secrets(\/|$)/.test(lower))
+        return true;
+    if (/(^|\/)credentials(\/|$)/.test(lower) && /\.json$/i.test(base))
+        return true;
+    if (/\.pem$/i.test(base) || base.endsWith("_rsa"))
+        return true;
+    return false;
+}
 function normalizeProjectRelativePath(baseDir, inputPath) {
     const normalizedInput = inputPath.replace(/^\.\/+/, "");
     const baseName = path.basename(baseDir);
@@ -175,6 +203,9 @@ export const readFileTool = {
             if (!fullPath.startsWith(workspace)) {
                 return { success: false, error: "Accès refusé. Les fichiers doivent être dans le dossier workspace/." };
             }
+            if (isSensitiveProjectPath(normalizedPath)) {
+                return { success: false, error: "Accès refusé: chemin sensible (secrets / clés) protégé." };
+            }
             const content = fs.readFileSync(fullPath, "utf8");
             return { success: true, content };
         }
@@ -204,6 +235,9 @@ export const writeFileTool = {
             // Empêcher la traversée de répertoires
             if (!fullPath.startsWith(workspace)) {
                 return { success: false, error: "Accès refusé. Les fichiers doivent être écrits dans le dossier workspace/." };
+            }
+            if (isSensitiveProjectPath(normalizedPath)) {
+                return { success: false, error: "Accès refusé: chemin sensible (secrets / clés) protégé." };
             }
             const dir = path.dirname(fullPath);
             if (!fs.existsSync(dir))
@@ -235,6 +269,9 @@ export const listFilesTool = {
             // Empêcher la traversée de répertoires
             if (!fullPath.startsWith(workspace)) {
                 return { success: false, error: "Accès refusé. Vous ne pouvez lister que le dossier workspace/." };
+            }
+            if (isSensitiveProjectPath(normalizedPath)) {
+                return { success: false, error: "Accès refusé: répertoire sensible protégé." };
             }
             const files = fs.readdirSync(fullPath, { withFileTypes: true });
             return {

@@ -1,7 +1,18 @@
+import { randomUUID } from "crypto";
 import { chatCompletion, ChatMessage } from "./llm.js";
 import { history } from "../memory/history.js";
 import { registry } from "../tools/registry.js";
 import { env } from "../config/env.js";
+import fs from "fs";
+import path from "path";
+import {
+  buildPlan,
+  formatFinalSummary,
+  formatPlanPreview,
+  runOrchestration,
+} from "../agents/orchestrator.js";
+import { AgentStatusEvent, AgentStepResult, TaskStep } from "../agents/contracts.js";
+import { recordTaskMetrics } from "../memory/metrics.js";
 
 const TOKEN_SAVER = env.TOKEN_SAVER;
 const MAX_ITERATIONS = TOKEN_SAVER ? 60 : 200;
@@ -9,34 +20,75 @@ const HISTORY_LIMIT = TOKEN_SAVER ? 8 : 20;
 const MAX_TOOL_CONTENT_CHARS = TOKEN_SAVER ? 700 : 2000;
 const MAX_MESSAGE_CONTENT_CHARS = TOKEN_SAVER ? 1400 : 5000;
 
-const SYSTEM_PROMPT = TOKEN_SAVER ? `Tu es OpenGravity, agent dev fiable et concis.
+const SYSTEM_PROMPT = TOKEN_SAVER
+  ? `Tu es OpenGravity, agent dev fiable et concis.
 Objectif: livrer du code propre, testé et sans hallucinations.
+Règles: français, pas d'hallucination d'actions, Angular 17+ propre, sécurité frontend, réponses courtes.`
+  : `Tu es OpenGravity, agent IA de développement expert. Réponds en français et livre du code robuste.`;
 
-Règles:
-- Toujours en français.
-- Ne jamais prétendre avoir modifié un fichier sans appel d'outil.
-- Utiliser write_file/execute_command pour les actions réelles.
-- Pour Angular 17+: standalone, app.config.ts, app.routes.ts, pas de module.ts.
-- Séparer services/models/guards/interceptors, logique métier dans services.
-- Sécurité: pas de innerHTML direct, Reactive Forms, guards, interceptor HTTP.
-- Projets longs: 1 étape à la fois, tester, annoncer "Étape X terminée", demander validation.
-- Avant d'exécuter une tâche, annoncer systématiquement:
-  1) le nombre d'étapes prévues,
-  2) le détail bref de chaque étape,
-  3) une estimation de durée totale.
-- Quand tout est fini, terminer la réponse par une confirmation explicite:
-  "TACHE TERMINEE: <résultat principal>".
-- Réponse utile mais courte (éviter le verbiage).` : `Tu es OpenGravity, un agent IA de développement expert.
-Objectif: livrer du code robuste et maintenable selon les besoins utilisateur.
+function createTaskBudget() {
+  const deadline = Date.now() + env.MAX_TASK_DURATION_MS;
+  let calls = 0;
+  return {
+    beforeLlmCall() {
+      if (Date.now() > deadline) {
+        throw new Error(
+          `Budget temps: la tâche a dépassé ${env.MAX_TASK_DURATION_MS} ms. Réduisez la portée ou augmentez MAX_TASK_DURATION_MS.`
+        );
+      }
+      calls++;
+      if (calls > env.MAX_LLM_CALLS_PER_TASK) {
+        throw new Error(
+          `Budget LLM: maximum ${env.MAX_LLM_CALLS_PER_TASK} appels atteint. Ajustez MAX_LLM_CALLS_PER_TASK si besoin.`
+        );
+      }
+    },
+    getCalls: () => calls,
+  };
+}
 
-Règles:
-- Réponds en français.
-- N'invente jamais d'actions non exécutées.
-- Utilise les outils pour modifier/valider.
-- Sur Angular 17+, applique standalone + architecture claire + sécurité frontend.
-- Pour tâches complexes: découpe en étapes, teste à chaque étape, demande validation utilisateur.
-- Avant d'exécuter, annonce nombre d'étapes + estimation de durée.
-- À la fin, confirme clairement avec "TACHE TERMINEE: ...".`;
+function loadCodingAgentSkillSnippet(): string {
+  const candidates = [
+    path.resolve(process.cwd(), "SKILL 2.md"),
+    path.resolve(process.cwd(), ".codex/skills/coding-agent/SKILL.md"),
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, "utf8");
+      const lines = content.split("\n");
+      const picked: string[] = [];
+      for (const line of lines) {
+        const l = line.trim();
+        if (!l) continue;
+        if (/Always use `pty:true`/i.test(l)) picked.push("- Toujours utiliser pty:true pour les agents CLI interactifs.");
+        if (/workdir/i.test(l) && /focused|focus/i.test(l)) picked.push("- Toujours fixer workdir au projet cible pour eviter les actions hors contexte.");
+        if (/background/i.test(l) && /monitor|progress/i.test(l)) picked.push("- Pour longues taches, preferer background + suivi regulier de progression.");
+        if (/exec/i.test(l) && /one-shot|runs and exits|exits cleanly/i.test(l)) picked.push("- Pour taches simples, preferer un mode one-shot propre.");
+        if (/Respect tool choice/i.test(l)) picked.push("- Respecter strictement l'agent demande (pas de substitution silencieuse).");
+      }
+      if (picked.length > 0) return picked.slice(0, 5).join("\n");
+    } catch {
+      // ignore read errors, fallback below
+    }
+  }
+
+  return [
+    "- Toujours executer dans le bon dossier projet.",
+    "- Utiliser des etapes courtes et verifier apres chaque etape.",
+    "- Eviter les actions implicites non verifiees.",
+  ].join("\n");
+}
+
+const CODING_AGENT_SKILL_SNIPPET = loadCodingAgentSkillSnippet();
+
+function roleSpecificSkillHints(role: TaskStep["role"]): string {
+  if (role === "developer" || role === "planner" || role === "tester") {
+    return `Regles skill coding-agent:\n${CODING_AGENT_SKILL_SNIPPET}`;
+  }
+  return "Regles skill coding-agent: rester concis, verifier et signaler clairement les resultats.";
+}
 
 function compactContent(content: string, maxLength: number): string {
   const oneLine = content.replace(/\s+/g, " ").trim();
@@ -47,189 +99,215 @@ function compactContent(content: string, maxLength: number): string {
 function compactToolResult(result: unknown): string {
   if (typeof result === "string") return compactContent(result, MAX_TOOL_CONTENT_CHARS);
   try {
-    const json = JSON.stringify(result);
-    return compactContent(json, MAX_TOOL_CONTENT_CHARS);
+    return compactContent(JSON.stringify(result), MAX_TOOL_CONTENT_CHARS);
   } catch {
     return "[résultat outil non sérialisable]";
   }
 }
 
-export async function processUserMessage(userId: number, text: string): Promise<string> {
-  // 1. Ajouter le message de l'utilisateur à l'historique
-  history.addMessage(userId, "user", text);
+function truncateForStep(text: string, maxChars?: number): string {
+  if (maxChars == null || maxChars <= 0) return text;
+  if (text.length <= maxChars) return text;
+  return `${compactContent(text, maxChars)}\n...[tronqué: budget MAX_PROMPT_CHARS_PER_STEP]`;
+}
 
-  // 2. Construire la liste des messages
+function buildMessages(userId: number, userText: string, systemPrompt: string): ChatMessage[] {
   const userHistory = history.getHistory(userId, HISTORY_LIMIT);
-
-  const messages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+  return [
+    { role: "system", content: systemPrompt },
     ...userHistory
-    .map(msg => {
-      const mappedMsg: any = {
-        role: msg.role as "user" | "assistant" | "system" | "tool",
-        content: msg.content !== "" ? msg.content : null,
-      };
-      // Réduire la taille des contenus historiques pour limiter le nombre de tokens.
-      if (typeof mappedMsg.content === "string") {
-        const maxLen = msg.role === "tool" ? MAX_TOOL_CONTENT_CHARS : MAX_MESSAGE_CONTENT_CHARS;
-        mappedMsg.content = compactContent(mappedMsg.content, maxLen);
-      }
-      if (msg.toolCalls) {
-        try {
-          mappedMsg.tool_calls = JSON.parse(msg.toolCalls);
-        } catch {
-          mappedMsg.tool_calls = undefined;
+      .map((msg) => {
+        const mappedMsg: any = {
+          role: msg.role as "user" | "assistant" | "system" | "tool",
+          content: msg.content !== "" ? msg.content : null,
+        };
+        if (typeof mappedMsg.content === "string") {
+          const maxLen = msg.role === "tool" ? MAX_TOOL_CONTENT_CHARS : MAX_MESSAGE_CONTENT_CHARS;
+          mappedMsg.content = compactContent(mappedMsg.content, maxLen);
         }
-      }
-      if (msg.toolCallId) mappedMsg.tool_call_id = msg.toolCallId;
-      if (msg.name) mappedMsg.name = msg.name;
-      // Gemini exige un nom non vide pour les réponses d'outils.
-      if (mappedMsg.role === "tool" && !mappedMsg.name) {
-        mappedMsg.name = "unknown_tool";
-      }
-      return mappedMsg;
-    })
-    // Écarter les messages outils invalides (anciens historiques incomplets).
-    .filter((msg) => !(msg.role === "tool" && !msg.tool_call_id))
+        if (msg.toolCalls) {
+          try {
+            mappedMsg.tool_calls = JSON.parse(msg.toolCalls);
+          } catch {
+            mappedMsg.tool_calls = undefined;
+          }
+        }
+        if (msg.toolCallId) mappedMsg.tool_call_id = msg.toolCallId;
+        if (msg.name) mappedMsg.name = msg.name;
+        if (mappedMsg.role === "tool" && !mappedMsg.name) mappedMsg.name = "unknown_tool";
+        return mappedMsg;
+      })
+      .filter((msg) => !(msg.role === "tool" && !msg.tool_call_id)),
+    { role: "user", content: userText },
   ];
+}
 
+async function runSingleAgent(
+  userId: number,
+  userText: string,
+  options?: {
+    allowTools?: boolean;
+    systemPrompt?: string;
+    persistUserMessage?: boolean;
+    budget?: ReturnType<typeof createTaskBudget>;
+    maxOutputChars?: number;
+  }
+): Promise<string> {
+  let allowTools = options?.allowTools ?? true;
+  const systemPrompt = options?.systemPrompt ?? SYSTEM_PROMPT;
+  const persistUserMessage = options?.persistUserMessage ?? false;
+  const budget = options?.budget;
+  const maxOut = options?.maxOutputChars ?? 5000;
+
+  const toolsConfig = registry.getOpenAIToolsConfig();
+  if (allowTools && toolsConfig.length === 0) {
+    allowTools = false;
+  }
+
+  const degradationNote =
+    allowTools === false && (options?.allowTools ?? true)
+      ? "\n\nMODE DEGRADE: outils indisponibles — analyse et propose uniquement sans exécution d'outils."
+      : "";
+
+  if (persistUserMessage) {
+    history.addMessage(userId, "user", userText);
+  }
+
+  const messages = buildMessages(userId, userText + degradationNote, systemPrompt);
   let iterations = 0;
-  let finalResponse = "Désolé, j'ai atteint ma limite de réflexion (15 itérations) pour cette tâche spécifique. La requête était peut-être trop complexe ou longue.";
+  let finalResponse =
+    "Désolé, je n'ai pas pu finaliser correctement cette étape. Réessaie avec plus de détails.";
   const verifiedActions: string[] = [];
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
+    const tools = allowTools ? registry.getOpenAIToolsConfig() : undefined;
 
-    const isSimpleChat =
-      TOKEN_SAVER &&
-      iterations === 1 &&
-      !/[\/\\]|fichier|file|code|projet|crée|cree|modifie|écris|ecris|commande|terminal|install|bug|erreur|fix|refactor/i.test(text);
-    const tools = isSimpleChat ? undefined : registry.getOpenAIToolsConfig();
+    budget?.beforeLlmCall();
+    const llmMessage = await chatCompletion(messages, tools);
+    if (!llmMessage) break;
 
-    console.log(`[Agent] Itération ${iterations} - Appel LLM...`);
+    messages.push({
+      role: "assistant",
+      content: llmMessage.content || null,
+      ...(llmMessage.tool_calls ? { tool_calls: llmMessage.tool_calls } : {}),
+    });
 
-    try {
-      const llmMessage = await chatCompletion(messages, tools);
-
-      if (!llmMessage) {
-        break;
-      }
-
-      // Ajouter la réponse de l'assistant aux messages contextuels, purgée des clés non supportées par l'API
-      messages.push({
-        role: "assistant",
-        content: llmMessage.content || null,
-        ...(llmMessage.tool_calls ? { tool_calls: llmMessage.tool_calls } : {})
-      });
-
-      // Sauvegarder dans l'historique si ce message de l'assistant contient des appels d'outils
-      if (llmMessage.tool_calls && llmMessage.tool_calls.length > 0) {
-        history.addMessage(userId, "assistant", llmMessage.content || "", JSON.stringify(llmMessage.tool_calls));
-      }
-
-      // --- PATCH POUR OLLAMA / QWEN2.5 ---
-      // Certains modèles ressortent les tool calls sous forme de texte balisé au lieu de JSON natif.
-      // Ex: <function/execute_command{"command": "ls"}></function>
-      if (llmMessage.content && (!llmMessage.tool_calls || llmMessage.tool_calls.length === 0)) {
-        const altRegex = /<function\/([a-zA-Z0-9_]+)([\s\S]*?)><\/function>/g;
-        let match;
-        const extractedTools = [];
-        while ((match = altRegex.exec(llmMessage.content)) !== null) {
-          extractedTools.push({
-            id: `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-            type: "function",
-            function: {
-              name: match[1],
-              arguments: match[2]
-            }
-          });
+    if (llmMessage.tool_calls && llmMessage.tool_calls.length > 0 && allowTools) {
+      for (const toolCall of llmMessage.tool_calls) {
+        const name = toolCall.function.name;
+        const argsStr = toolCall.function.arguments?.trim() ?? "{}";
+        let args = {};
+        try {
+          args = JSON.parse(argsStr.replace(/^\s*\`\`\`(json)?\s*/i, "").replace(/\s*\`\`\`\s*$/i, "").trim());
+        } catch (e: any) {
+          args = { error: `Format JSON invalide: ${e.message}` };
         }
-        if (extractedTools.length > 0) {
-          llmMessage.tool_calls = extractedTools;
-          // Nettoyer le contenu pour l'utilisateur
-          llmMessage.content = llmMessage.content.replace(altRegex, "").trim();
-          if (llmMessage.content === "") llmMessage.content = null;
-        }
+
+        const result = await registry.executeTool(name, args);
+        const resultStr = TOKEN_SAVER ? compactToolResult(result) : typeof result === "string" ? result : JSON.stringify(result);
+        verifiedActions.push(`${name}`);
+        messages.push({
+          role: "tool",
+          name,
+          tool_call_id: toolCall.id,
+          content: resultStr,
+        });
       }
-      // -----------------------------------
+      continue;
+    }
 
-      // Si le LLM veut utiliser un outil
-      if (llmMessage.tool_calls && llmMessage.tool_calls.length > 0) {
-        for (const toolCall of llmMessage.tool_calls) {
-          const name = toolCall.function.name;
-          const argsStr = toolCall.function.arguments;
-
-          console.log(`[Agent] Outil demandé : ${name} avec args : ${argsStr}`);
-
-          let argsStrClean = argsStr.trim();
-          // Supprimer les blocs de markdown potentiels qui encadrent parfois le JSON
-          argsStrClean = argsStrClean.replace(/^\\s*\`\`\`(json)?\\s*/i, "").replace(/\\s*\`\`\`\\s*$/i, "").trim();
-
-          let args = {};
-          try {
-            args = JSON.parse(argsStrClean);
-          } catch (e: any) {
-            console.error("Erreur de parsing des arguments JSON :", argsStrClean);
-            args = { error: "Format JSON invalide: " + e.message };
-          }
-
-          const result = await registry.executeTool(name, args);
-          console.log(`[Agent] Résultat outil :`, result);
-          if (name === "write_file") {
-            const filePath = typeof (args as any)?.path === "string" ? (args as any).path : "(path inconnu)";
-            verifiedActions.push(`write_file: ${filePath}`);
-          } else if (name === "read_file") {
-            const filePath = typeof (args as any)?.path === "string" ? (args as any).path : "(path inconnu)";
-            verifiedActions.push(`read_file: ${filePath}`);
-          } else if (name === "list_files") {
-            const dirPath = typeof (args as any)?.path === "string" ? (args as any).path : ".";
-            verifiedActions.push(`list_files: ${dirPath}`);
-          } else if (name === "execute_command") {
-            const cmd = typeof (args as any)?.command === "string" ? (args as any).command : "(commande inconnue)";
-            const cwd = typeof (args as any)?.cwd === "string" ? (args as any).cwd : "(projet actif)";
-            verifiedActions.push(`execute_command: ${cmd} | cwd=${cwd}`);
-          } else {
-            verifiedActions.push(`tool: ${name}`);
-          }
-
-          const resultStr = TOKEN_SAVER
-            ? compactToolResult(result)
-            : (typeof result === "string" ? result : JSON.stringify(result));
-
-          messages.push({
-            role: "tool",
-            name: name,
-            tool_call_id: toolCall.id,
-            content: resultStr
-          });
-
-          // Sauvegarder la réponse de l'outil dans l'historique
-          history.addMessage(userId, "tool", resultStr, undefined, toolCall.id, name);
-        }
-        continue;
+    if (llmMessage.content) {
+      const actions = Array.from(new Set(verifiedActions));
+      let content = llmMessage.content;
+      if (content.length > maxOut) {
+        content = compactContent(content, maxOut) + "\n...[sortie tronquée pour budget étape]";
       }
-
-      if (llmMessage.content) {
-        const uniqueActions = Array.from(new Set(verifiedActions));
-        const actionsSummary =
-          uniqueActions.length > 0
-            ? `\n\nActions verifiees:\n${uniqueActions.map((a) => `- ${a}`).join("\n")}`
-            : "\n\nActions verifiees:\n- Aucune action outil executee dans ce tour.";
-        finalResponse = `${llmMessage.content}${actionsSummary}`;
-        // On stocke une version compacte pour réduire les tokens des prochains tours.
-        history.addMessage(
-          userId,
-          "assistant",
-          TOKEN_SAVER ? compactContent(llmMessage.content, MAX_MESSAGE_CONTENT_CHARS) : llmMessage.content
-        );
-        break;
-      }
-    } catch (error: any) {
-      console.error("❌ Erreur dans la boucle de l'agent:", error.message);
-      finalResponse = `Une erreur est survenue avec le service LLM. Vérifiez vos clés API et la connexion réseau. Détail: ${error?.message || "inconnu"}`;
+      finalResponse =
+        actions.length > 0
+          ? `${content}\n\nActions verifiees:\n${actions.map((a) => `- ${a}`).join("\n")}`
+          : content;
+      history.addMessage(
+        userId,
+        "assistant",
+        TOKEN_SAVER ? compactContent(llmMessage.content, MAX_MESSAGE_CONTENT_CHARS) : llmMessage.content
+      );
       break;
     }
   }
 
   return finalResponse;
+}
+
+export async function processUserMessage(
+  userId: number,
+  text: string,
+  onStatus?: (event: AgentStatusEvent) => Promise<void> | void
+): Promise<string> {
+  const taskId = randomUUID().slice(0, 8);
+  const t0 = Date.now();
+  const startedAt = new Date(t0).toISOString();
+  const budget = createTaskBudget();
+  let results: AgentStepResult[] = [];
+  let caughtError: string | null = null;
+
+  try {
+    history.addMessage(userId, "user", text);
+    const plan = buildPlan(text);
+    const planPreview = formatPlanPreview(plan);
+
+    results = await runOrchestration(
+      plan,
+      async (step: TaskStep) => {
+        const rolePrompt = truncateForStep(
+          [
+            `ROLE AGENT: ${step.role}`,
+            `OBJECTIF ETAPE: ${step.title}`,
+            `INSTRUCTION: ${step.prompt}`,
+            roleSpecificSkillHints(step.role),
+            `DEMANDE UTILISATEUR: ${text}`,
+          ].join("\n"),
+          step.maxPromptChars
+        );
+        return await runSingleAgent(userId, rolePrompt, {
+          allowTools: step.allowTools,
+          persistUserMessage: false,
+          budget,
+          maxOutputChars: step.maxOutputChars,
+        });
+      },
+      onStatus,
+      { taskId, planPreview }
+    );
+
+    const details = results
+      .map((r, i) => `Etape ${i + 1} (${r.role})\n${compactContent(r.output, 1200)}`)
+      .join("\n\n");
+
+    return `${planPreview}\n\n${details}\n\n${formatFinalSummary(results)}`;
+  } catch (e: unknown) {
+    caughtError = e instanceof Error ? e.message : String(e);
+    if (onStatus) {
+      await onStatus({
+        type: "error",
+        taskId,
+        message: `Erreur fatale: ${caughtError}. Action: vérifier les logs serveur et la configuration .env.`,
+      });
+    }
+    throw e;
+  } finally {
+    const ok = caughtError == null && results.length > 0 && results.every((r) => r.ok);
+    recordTaskMetrics({
+      taskId,
+      userId,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      durationMs: Date.now() - t0,
+      llmCalls: budget.getCalls(),
+      ok,
+      errorMessage: caughtError,
+      stepsOk: results.filter((r) => r.ok).length,
+      stepsTotal: results.length,
+    });
+  }
 }
