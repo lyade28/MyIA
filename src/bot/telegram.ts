@@ -10,6 +10,22 @@ import { Readable } from "stream";
 
 export const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
 
+function extractCommandArg(text: string, command: string): string {
+  const regex = new RegExp(`^\\/${command}(?:@\\w+)?\\s*`, "i");
+  return text.replace(regex, "").trim();
+}
+
+function buildAgentTask(task: string): string {
+  return [
+    "MODE AGENT AUTO ACTIVE.",
+    "Traite cette demande comme une tache d'implementation complete.",
+    "Avant d'executer, annonce le nombre d'etapes et le temps estime.",
+    "Execute ensuite en respectant les etapes et termine avec: TACHE TERMINEE: ...",
+    "",
+    `Tache utilisateur: ${task}`,
+  ].join("\n");
+}
+
 // Middleware strict de Whitelist
 bot.use(async (ctx: Context, next: NextFunction) => {
   const userId = ctx.from?.id;
@@ -43,10 +59,41 @@ bot.command("clear", async (ctx) => {
   }
 });
 
+// Commande dédiée: exécution d'une tâche "mode agent"
+bot.command("run-agent", async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const rawText = ctx.message?.text ?? "";
+  const task = extractCommandArg(rawText, "run-agent");
+
+  if (!task) {
+    await ctx.reply(
+      "Usage: /run-agent <tache>\nExemple: /run-agent Cree un composant Angular standalone pour la page dashboard."
+    );
+    return;
+  }
+
+  await ctx.replyWithChatAction("typing");
+
+  const framedTask = buildAgentTask(task);
+
+  try {
+    const response = await processUserMessage(userId, framedTask);
+    for (let i = 0; i < response.length; i += 4000) {
+      await ctx.reply(response.substring(i, i + 4000));
+    }
+  } catch (error: any) {
+    console.error("❌ Erreur run-agent :", error);
+    await ctx.reply("❌ Une erreur est survenue pendant l'execution de /run-agent.");
+  }
+});
+
 // Gestion des messages texte
 bot.on("message:text", async (ctx) => {
   const userId = ctx.from.id;
   const text = ctx.message.text;
+  if (text.trim().startsWith("/")) return;
 
   console.log(`💬 Message de ${userId}: ${text}`);
   
@@ -54,7 +101,7 @@ bot.on("message:text", async (ctx) => {
   await ctx.replyWithChatAction("typing");
 
   try {
-    const response = await processUserMessage(userId, text);
+    const response = await processUserMessage(userId, buildAgentTask(text));
     // Diviser le message s'il est trop long pour Telegram (>4096)
     for (let i = 0; i < response.length; i += 4000) {
       await ctx.reply(response.substring(i, i + 4000));

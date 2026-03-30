@@ -95,6 +95,20 @@ function resolveBaseDir(workspace: string, optionalCwd?: string): string {
   return workspace;
 }
 
+function normalizeProjectRelativePath(baseDir: string, inputPath: string): string {
+  const normalizedInput = inputPath.replace(/^\.\/+/, "");
+  const baseName = path.basename(baseDir);
+  if (!baseName || baseName === "workspace") return normalizedInput;
+
+  // Si le chemin commence déjà par le nom du projet actif, on retire ce préfixe
+  // pour éviter les doublons du type task-manager/task-manager/...
+  if (normalizedInput === baseName) return ".";
+  if (normalizedInput.startsWith(`${baseName}/`)) {
+    return normalizedInput.slice(baseName.length + 1);
+  }
+  return normalizedInput;
+}
+
 function extractCreatedProjectPath(command: string, execCwd: string): string | null {
   const ngNewMatch = command.match(/(?:^|\s)ng\s+new\s+([a-zA-Z0-9._-]+)/);
   if (ngNewMatch?.[1]) {
@@ -162,8 +176,8 @@ export const readFileTool: Tool = {
     try {
       const workspace = ensureWorkspace();
       const baseDir = resolveBaseDir(workspace);
-      
-      const fullPath = path.resolve(baseDir, filePath);
+      const normalizedPath = normalizeProjectRelativePath(baseDir, filePath);
+      const fullPath = path.resolve(baseDir, normalizedPath);
       
       // Empêcher la traversée de répertoires (Directory Traversal)
       if (!fullPath.startsWith(workspace)) {
@@ -194,8 +208,8 @@ export const writeFileTool: Tool = {
     try {
       const workspace = ensureWorkspace();
       const baseDir = resolveBaseDir(workspace);
-      
-      const fullPath = path.resolve(baseDir, filePath);
+      const normalizedPath = normalizeProjectRelativePath(baseDir, filePath);
+      const fullPath = path.resolve(baseDir, normalizedPath);
       
       // Empêcher la traversée de répertoires
       if (!fullPath.startsWith(workspace)) {
@@ -226,8 +240,8 @@ export const listFilesTool: Tool = {
     try {
       const workspace = ensureWorkspace();
       const baseDir = resolveBaseDir(workspace);
-      
-      const fullPath = path.resolve(baseDir, dirPath);
+      const normalizedPath = normalizeProjectRelativePath(baseDir, dirPath);
+      const fullPath = path.resolve(baseDir, normalizedPath);
       
       // Empêcher la traversée de répertoires
       if (!fullPath.startsWith(workspace)) {

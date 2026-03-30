@@ -19,8 +19,30 @@ async function main() {
     registry.register(writeFileTool);
     registry.register(listFilesTool);
     console.log(`✅ Outils enregistrés: ${registry.getAllTools().map(t => t.name).join(", ")}`);
-    // 3. Infos sur LLM
-    console.log(`✅ Modèle prêt: ${env.GROQ_API_KEY ? "Groq" : "OpenRouter Fallback"}`);
+    // 3. Infos sur LLM (ordre réel de priorité)
+    const providerOrder = [];
+    if (env.OPENROUTER_ONLY) {
+        providerOrder.push(`OpenRouter only (${env.OPENROUTER_MODEL})`);
+    }
+    else if (env.GEMINI_ONLY) {
+        providerOrder.push(`Gemini only (${env.GEMINI_MODEL})`);
+    }
+    else {
+        if (env.OLLAMA_MODEL)
+            providerOrder.push(`Ollama (${env.OLLAMA_MODEL})`);
+        if (env.GEMINI_API_KEY)
+            providerOrder.push(`Gemini (${env.GEMINI_MODEL})`);
+        if (env.GROQ_API_KEY)
+            providerOrder.push("Groq");
+        if (env.OPENROUTER_API_KEY)
+            providerOrder.push(`OpenRouter (${env.OPENROUTER_MODEL})`);
+    }
+    if (providerOrder.length > 0) {
+        console.log(`✅ Ordre LLM: ${providerOrder.join(" -> ")}`);
+    }
+    else {
+        console.log("⚠️ Aucun fournisseur LLM configuré.");
+    }
     // 4. Démarrer le bot
     await startBot();
 }

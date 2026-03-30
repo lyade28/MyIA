@@ -1,47 +1,58 @@
 import { chatCompletion, ChatMessage } from "./llm.js";
 import { history } from "../memory/history.js";
 import { registry } from "../tools/registry.js";
+import { env } from "../config/env.js";
 
-const MAX_ITERATIONS = 200;
-const HISTORY_LIMIT = 12;
-const MAX_TOOL_CONTENT_CHARS = 1500;
-const MAX_MESSAGE_CONTENT_CHARS = 4000;
+const TOKEN_SAVER = env.TOKEN_SAVER;
+const MAX_ITERATIONS = TOKEN_SAVER ? 60 : 200;
+const HISTORY_LIMIT = TOKEN_SAVER ? 8 : 20;
+const MAX_TOOL_CONTENT_CHARS = TOKEN_SAVER ? 700 : 2000;
+const MAX_MESSAGE_CONTENT_CHARS = TOKEN_SAVER ? 1400 : 5000;
 
-const SYSTEM_PROMPT = `Tu es OpenGravity, un agent IA de développement avec des "Superpowers".
-Ton objectif est de créer des applications de haute qualité selon les besoins de l'utilisateur.
+const SYSTEM_PROMPT = TOKEN_SAVER ? `Tu es OpenGravity, agent dev fiable et concis.
+Objectif: livrer du code propre, testé et sans hallucinations.
 
-### TON WORKFLOW (OBLIGATOIRE) :
-1. **Brainstorming** : Clarifie le besoin.
-2. **Planning** : Crée un plan d'implémentation.
-3. **Execution** : Écris LE CODE COMPLET. Utilise toujours l'outil \`write_file\` ou \`execute_command\`.
-4. **Vérification** : Teste le résultat.
+Règles:
+- Toujours en français.
+- Ne jamais prétendre avoir modifié un fichier sans appel d'outil.
+- Utiliser write_file/execute_command pour les actions réelles.
+- Pour Angular 17+: standalone, app.config.ts, app.routes.ts, pas de module.ts.
+- Séparer services/models/guards/interceptors, logique métier dans services.
+- Sécurité: pas de innerHTML direct, Reactive Forms, guards, interceptor HTTP.
+- Projets longs: 1 étape à la fois, tester, annoncer "Étape X terminée", demander validation.
+- Avant d'exécuter une tâche, annoncer systématiquement:
+  1) le nombre d'étapes prévues,
+  2) le détail bref de chaque étape,
+  3) une estimation de durée totale.
+- Quand tout est fini, terminer la réponse par une confirmation explicite:
+  "TACHE TERMINEE: <résultat principal>".
+- Réponse utile mais courte (éviter le verbiage).` : `Tu es OpenGravity, un agent IA de développement expert.
+Objectif: livrer du code robuste et maintenable selon les besoins utilisateur.
 
-### PROTOCOLE PROJETS LONGS (OBLIGATOIRE) :
-- Si la demande est longue/complexe, découpe en étapes courtes (3 à 7 étapes max).
-- N'exécute qu'UNE étape à la fois.
-- À la fin de chaque étape :
-  1) exécute des tests/validations adaptés à l'étape (\`npm run build\`, tests unitaires, lint, etc.),
-  2) annonce clairement "Étape X terminée",
-  3) liste ce qui a été fait et les fichiers touchés,
-  4) demande explicitement la validation utilisateur avant de passer à l'étape suivante.
-- Ne passe JAMAIS automatiquement à l'étape suivante sans validation explicite de l'utilisateur.
+Règles:
+- Réponds en français.
+- N'invente jamais d'actions non exécutées.
+- Utilise les outils pour modifier/valider.
+- Sur Angular 17+, applique standalone + architecture claire + sécurité frontend.
+- Pour tâches complexes: découpe en étapes, teste à chaque étape, demande validation utilisateur.
+- Avant d'exécuter, annonce nombre d'étapes + estimation de durée.
+- À la fin, confirme clairement avec "TACHE TERMINEE: ...".`;
 
-### RÈGLES CRITIQUES (POUR ÉVITER LES HALLUCINATIONS ET BLOCAGES) :
-- **Ne mens JAMAIS**. Ne dis jamais "J'ai créé le fichier" si tu n'as pas explicitement appelé l'outil \`write_file\` avec le contenu complet du code.
-- **Transparence obligatoire** : En fin de réponse, liste les chemins exacts réellement créés/modifiés et les commandes réellement exécutées.
-- **Pas de code partiel**. Ne laisse pas de commentaires du type "// le reste du code ici". Tu dois générer la totalité du code d'un composant.
-- **Commandes Shell** : Si tu utilises \`execute_command\` pour créer un projet (ex: Angular, React, Vite), tu dois OBLIGATOIREMENT utiliser des flags non interactifs (ex: \`--defaults\`, \`-y\`, \`--routing=true --style=css\`). Évite d'inventer des drapeaux malformés (ex: \`--no//router\`).
-- **Dépendances NPM** : Si tu rencontres des erreurs ERESOLVE avec \`npm install\`, relance la commande avec \`--legacy-peer-deps\` ou \`--force\`. N'UTILISE PAS d'anciens paquets dépréciés comme \`@angular/flex-layout\`.
-- **Frameworks Modernes (Angular 17+)** : Utilise Standalone Components, \`bootstrapApplication\`, \`app.config.ts\`, \`app.routes.ts\`. Ne génère pas de \`.module.ts\`.
-- **Architecture Angular stricte** : sépare \`components\`, \`services\`, \`models\`, \`guards\`, \`interceptors\`; logique métier dans les services; composants simples.
-- **Qualité Angular expert** : priorité RxJS, \`ChangeDetectionStrategy.OnPush\`, Reactive Forms, code DRY, lisible, maintenable.
-- **Sécurité Angular** : n'utilise jamais \`innerHTML\` directement, n'expose jamais de secrets, utilise guards pour routes sécurisées, toutes requêtes HTTP passent par interceptor.
-- Ne fais jamais d'installation globale. Installe localement si besoin.
-- **IMPORTANT CONTEXTE** : Pense à utiliser l'argument 'cwd' pour l'outil execute_command si tu dois agir dans un sous-projet. Et pour write_file, utilise TOUJOURS le chemin relatif complet.
+function compactContent(content: string, maxLength: number): string {
+  const oneLine = content.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLength) return oneLine;
+  return `${oneLine.slice(0, maxLength)} ...[tronqué]`;
+}
 
-### TES PRINCIPES :
-- DRY (Don't Repeat Yourself) et YAGNI.
-- Réponds toujours en français.`;
+function compactToolResult(result: unknown): string {
+  if (typeof result === "string") return compactContent(result, MAX_TOOL_CONTENT_CHARS);
+  try {
+    const json = JSON.stringify(result);
+    return compactContent(json, MAX_TOOL_CONTENT_CHARS);
+  } catch {
+    return "[résultat outil non sérialisable]";
+  }
+}
 
 export async function processUserMessage(userId: number, text: string): Promise<string> {
   // 1. Ajouter le message de l'utilisateur à l'historique
@@ -61,9 +72,7 @@ export async function processUserMessage(userId: number, text: string): Promise<
       // Réduire la taille des contenus historiques pour limiter le nombre de tokens.
       if (typeof mappedMsg.content === "string") {
         const maxLen = msg.role === "tool" ? MAX_TOOL_CONTENT_CHARS : MAX_MESSAGE_CONTENT_CHARS;
-        if (mappedMsg.content.length > maxLen) {
-          mappedMsg.content = `${mappedMsg.content.slice(0, maxLen)}\n...[contenu tronqué]`;
-        }
+        mappedMsg.content = compactContent(mappedMsg.content, maxLen);
       }
       if (msg.toolCalls) {
         try {
@@ -91,7 +100,11 @@ export async function processUserMessage(userId: number, text: string): Promise<
   while (iterations < MAX_ITERATIONS) {
     iterations++;
 
-    const tools = registry.getOpenAIToolsConfig();
+    const isSimpleChat =
+      TOKEN_SAVER &&
+      iterations === 1 &&
+      !/[\/\\]|fichier|file|code|projet|crée|cree|modifie|écris|ecris|commande|terminal|install|bug|erreur|fix|refactor/i.test(text);
+    const tools = isSimpleChat ? undefined : registry.getOpenAIToolsConfig();
 
     console.log(`[Agent] Itération ${iterations} - Appel LLM...`);
 
@@ -179,7 +192,9 @@ export async function processUserMessage(userId: number, text: string): Promise<
             verifiedActions.push(`tool: ${name}`);
           }
 
-          const resultStr = typeof result === "string" ? result : JSON.stringify(result);
+          const resultStr = TOKEN_SAVER
+            ? compactToolResult(result)
+            : (typeof result === "string" ? result : JSON.stringify(result));
 
           messages.push({
             role: "tool",
@@ -201,7 +216,12 @@ export async function processUserMessage(userId: number, text: string): Promise<
             ? `\n\nActions verifiees:\n${uniqueActions.map((a) => `- ${a}`).join("\n")}`
             : "\n\nActions verifiees:\n- Aucune action outil executee dans ce tour.";
         finalResponse = `${llmMessage.content}${actionsSummary}`;
-        history.addMessage(userId, "assistant", finalResponse);
+        // On stocke une version compacte pour réduire les tokens des prochains tours.
+        history.addMessage(
+          userId,
+          "assistant",
+          TOKEN_SAVER ? compactContent(llmMessage.content, MAX_MESSAGE_CONTENT_CHARS) : llmMessage.content
+        );
         break;
       }
     } catch (error: any) {

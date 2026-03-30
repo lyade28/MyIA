@@ -3,7 +3,7 @@ import { env } from "../config/env.js";
 import fs from "fs";
 
 // Client Groq
-export const groq = new Groq({ apiKey: env.GROQ_API_KEY });
+export const groq = env.GROQ_API_KEY ? new Groq({ apiKey: env.GROQ_API_KEY }) : null;
 
 // Paramètres LLM
 export const MODEL = "llama-3.3-70b-versatile";
@@ -29,9 +29,69 @@ export async function chatCompletion(
 ): Promise<any> {
   const providerErrors: string[] = [];
   const useTools = !!(tools && tools.length > 0);
+  const geminiOnly = env.GEMINI_ONLY;
+  const openRouterOnly = env.OPENROUTER_ONLY;
+
+  const callOpenRouter = async () => {
+    if (!env.OPENROUTER_API_KEY) {
+      providerErrors.push("OpenRouter: OPENROUTER_API_KEY manquante");
+      return null;
+    }
+    console.log(`🤖 Tentative avec OpenRouter (${env.OPENROUTER_MODEL})...`);
+    let response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: env.OPENROUTER_MODEL,
+        messages,
+        tools: useTools ? tools : undefined
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const message = data?.choices?.[0]?.message;
+      if (message) return message;
+      providerErrors.push("OpenRouter: réponse vide");
+      return null;
+    }
+
+    let errorText = await response.text();
+    if (useTools && /tool|function|invalid/i.test(errorText)) {
+      console.warn("⚠️ OpenRouter a refusé les tools, nouvelle tentative sans tools...");
+      response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: env.OPENROUTER_MODEL,
+          messages
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const message = data?.choices?.[0]?.message;
+        if (message) return message;
+      }
+      errorText = await response.text();
+    }
+    providerErrors.push(`OpenRouter: HTTP ${response.status} (${errorText.slice(0, 200)})`);
+    return null;
+  };
+
+  if (openRouterOnly) {
+    const openRouterMessage = await callOpenRouter();
+    if (openRouterMessage) return openRouterMessage;
+    throw new Error(`Mode OpenRouter-only actif. Détails: ${providerErrors.join(" | ")}`);
+  }
 
   // 1. Tentative Ollama (Local) si configuré (prioritaire)
-  if (env.OLLAMA_MODEL) {
+  if (!geminiOnly && env.OLLAMA_MODEL) {
     try {
       console.log(`🤖 Tentative avec Ollama (${env.OLLAMA_MODEL})...`);
       let response = await fetch(`${env.OLLAMA_API_URL}/v1/chat/completions`, {
@@ -130,64 +190,54 @@ export async function chatCompletion(
     }
   }
 
-  // 3. Tentative Groq
-  try {
-    const response = await groq.chat.completions.create({
-      model: MODEL,
-      messages: messages as any,
-      tools: tools,
-      tool_choice: tools && tools.length > 0 ? "auto" : "none",
-    });
+  // En mode Gemini-only, on bloque tous les autres fournisseurs.
+  if (geminiOnly) {
+    throw new Error(
+      `Mode Gemini-only actif. Détails: ${providerErrors.join(" | ")}`
+    );
+  }
 
-    const message = response.choices?.[0]?.message;
-    if (message) return message;
-    providerErrors.push("Groq: réponse vide");
-  } catch (error: any) {
-    console.error("❌ Erreur Groq:", error);
-    if (useTools && `${error?.message || ""}`.includes("tool_use_failed")) {
-      try {
-        console.warn("⚠️ Groq tool_use_failed, nouvelle tentative sans tools...");
-        const retry = await groq.chat.completions.create({
-          model: MODEL,
-          messages: messages as any,
-          tool_choice: "none",
-        } as any);
-        const retryMessage = retry.choices?.[0]?.message;
-        if (retryMessage) return retryMessage;
-      } catch (retryError: any) {
-        providerErrors.push(`Groq retry: ${retryError.message || "erreur inconnue"}`);
-      }
-    }
-    providerErrors.push(`Groq: ${error.message || "erreur inconnue"}`);
-    
-    // Fallback simple vers OpenRouter si configuré et échoue
-    if (env.OPENROUTER_API_KEY) {
-      console.log("🔄 Tentative de fallback via OpenRouter...");
-      try {
-        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: env.OPENROUTER_MODEL,
-            messages,
-            tools: tools && tools.length > 0 ? tools : undefined
-          })
-        });
-        if (!response.ok) {
-          const errorText = await response.text();
-          providerErrors.push(`OpenRouter: HTTP ${response.status} (${errorText.slice(0, 200)})`);
-        } else {
-          const data = await response.json();
-          const message = data?.choices?.[0]?.message;
-          if (message) return message;
-          providerErrors.push("OpenRouter: réponse vide");
+  // 3. Tentative Groq
+  if (groq) {
+    try {
+      const response = await groq.chat.completions.create({
+        model: MODEL,
+        messages: messages as any,
+        tools: tools,
+        tool_choice: tools && tools.length > 0 ? "auto" : "none",
+      });
+
+      const message = response.choices?.[0]?.message;
+      if (message) return message;
+      providerErrors.push("Groq: réponse vide");
+    } catch (error: any) {
+      console.error("❌ Erreur Groq:", error);
+      if (useTools && `${error?.message || ""}`.includes("tool_use_failed")) {
+        try {
+          console.warn("⚠️ Groq tool_use_failed, nouvelle tentative sans tools...");
+          const retry = await groq.chat.completions.create({
+            model: MODEL,
+            messages: messages as any,
+            tool_choice: "none",
+          } as any);
+          const retryMessage = retry.choices?.[0]?.message;
+          if (retryMessage) return retryMessage;
+        } catch (retryError: any) {
+          providerErrors.push(`Groq retry: ${retryError.message || "erreur inconnue"}`);
         }
-      } catch (fallbackError: any) {
-        console.error("❌ Erreur OpenRouter fallback:", fallbackError);
-        providerErrors.push(`OpenRouter: ${fallbackError.message || "erreur inconnue"}`);
+      }
+      providerErrors.push(`Groq: ${error.message || "erreur inconnue"}`);
+      
+      // Fallback simple vers OpenRouter si configuré et échoue
+      if (env.OPENROUTER_API_KEY) {
+        console.log("🔄 Tentative de fallback via OpenRouter...");
+        try {
+          const fallbackMessage = await callOpenRouter();
+          if (fallbackMessage) return fallbackMessage;
+        } catch (fallbackError: any) {
+          console.error("❌ Erreur OpenRouter fallback:", fallbackError);
+          providerErrors.push(`OpenRouter: ${fallbackError.message || "erreur inconnue"}`);
+        }
       }
     }
   }
@@ -198,6 +248,9 @@ export async function chatCompletion(
 }
 
 export async function transcribeAudio(filePath: string): Promise<string> {
+  if (!groq) {
+    throw new Error("Transcription indisponible: GROQ_API_KEY non configurée.");
+  }
   try {
     const translation = await groq.audio.transcriptions.create({
       file: fs.createReadStream(filePath),

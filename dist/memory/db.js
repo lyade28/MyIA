@@ -22,5 +22,17 @@ export function initDb() {
     CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
   `);
+    try {
+        db.exec("ALTER TABLE messages ADD COLUMN tool_calls TEXT;");
+    }
+    catch (e) { }
+    try {
+        db.exec("ALTER TABLE messages ADD COLUMN tool_call_id TEXT;");
+    }
+    catch (e) { }
+    try {
+        db.exec("ALTER TABLE messages ADD COLUMN name TEXT;");
+    }
+    catch (e) { }
     console.log("✅ Base de données initialisée.");
 }

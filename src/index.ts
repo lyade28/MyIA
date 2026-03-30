@@ -25,10 +25,16 @@ async function main() {
 
   // 3. Infos sur LLM (ordre réel de priorité)
   const providerOrder: string[] = [];
-  if (env.OLLAMA_MODEL) providerOrder.push(`Ollama (${env.OLLAMA_MODEL})`);
-  if (env.GEMINI_API_KEY) providerOrder.push(`Gemini (${env.GEMINI_MODEL})`);
-  if (env.GROQ_API_KEY) providerOrder.push("Groq");
-  if (env.OPENROUTER_API_KEY) providerOrder.push(`OpenRouter (${env.OPENROUTER_MODEL})`);
+  if (env.OPENROUTER_ONLY) {
+    providerOrder.push(`OpenRouter only (${env.OPENROUTER_MODEL})`);
+  } else if (env.GEMINI_ONLY) {
+    providerOrder.push(`Gemini only (${env.GEMINI_MODEL})`);
+  } else {
+    if (env.OLLAMA_MODEL) providerOrder.push(`Ollama (${env.OLLAMA_MODEL})`);
+    if (env.GEMINI_API_KEY) providerOrder.push(`Gemini (${env.GEMINI_MODEL})`);
+    if (env.GROQ_API_KEY) providerOrder.push("Groq");
+    if (env.OPENROUTER_API_KEY) providerOrder.push(`OpenRouter (${env.OPENROUTER_MODEL})`);
+  }
 
   if (providerOrder.length > 0) {
     console.log(`✅ Ordre LLM: ${providerOrder.join(" -> ")}`);

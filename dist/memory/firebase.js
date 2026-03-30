@@ -20,18 +20,25 @@ export function initFirebase() {
     }
 }
 export const firebaseHistory = {
-    addMessage: async (userId, role, content) => {
+    addMessage: async (userId, role, content, tool_calls, tool_call_id, name) => {
         if (!db)
             return;
         try {
-            await db.collection("conversations")
-                .doc(userId.toString())
-                .collection("messages")
-                .add({
+            const payload = {
                 role,
                 content,
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
-            });
+            };
+            if (tool_calls)
+                payload.tool_calls = tool_calls;
+            if (tool_call_id)
+                payload.tool_call_id = tool_call_id;
+            if (name)
+                payload.name = name;
+            await db.collection("conversations")
+                .doc(userId.toString())
+                .collection("messages")
+                .add(payload);
         }
         catch (error) {
             console.error("❌ Erreur sauvegarde Firebase :", error);
